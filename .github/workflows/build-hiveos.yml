@@ -22,11 +22,11 @@ jobs:
             --output type=local,dest=./dist \
             -f Dockerfile.build .
       - name: Show checksums
-        run: cat dist/prl0-0.1.7.tar.gz.sha256
+        run: cat dist/prl0-0.1.8.tar.gz.sha256
       - name: Upload HiveOS package
         uses: actions/upload-artifact@v4
         with:
-          name: prl0-hiveos-0.1.7
+          name: prl0-hiveos-0.1.8
           path: |
-            dist/prl0-0.1.7.tar.gz
-            dist/prl0-0.1.7.tar.gz.sha256
+            dist/prl0-0.1.8.tar.gz
+            dist/prl0-0.1.8.tar.gz.sha256

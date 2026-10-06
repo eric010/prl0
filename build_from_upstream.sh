@@ -6,7 +6,7 @@ WORK_ROOT="${1:-$KIT_DIR/.build}"
 OUT_DIR="${2:-$KIT_DIR/dist}"
 SRC_DIR="$WORK_ROOT/pearl-hashrate-miner"
 PKG_DIR="$WORK_ROOT/prl0"
-VERSION="0.1.7"
+VERSION="0.1.8"
 
 for x in git cargo nvcc; do
   command -v "$x" >/dev/null 2>&1 || { echo "Falta dependência de build: $x" >&2; exit 1; }

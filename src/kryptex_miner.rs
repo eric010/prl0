@@ -19,7 +19,7 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pearl_hashrate_miner::driver::{device_count, CapturedGraph, CudaCtx, DevBuf, Module, Stream};
-use pearl_hashrate_miner::gateway::{build_mining_config_triton_norotl, MiningConfig};
+use pearl_hashrate_miner::gateway::{build_mining_config_cpp_search, MiningConfig};
 use pearl_hashrate_miner::miner_bufs::HOST_SIGNAL_HEADER_SIZE;
 use pearl_hashrate_miner::error::cu_check;
 use cudarc::driver::sys as cu;
@@ -35,7 +35,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.7";
+const AGENT: &str = "prl0-kryptex/0.1.8";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -118,9 +118,9 @@ impl SharedPool {
 }
 
 fn mining_config() -> Result<MiningConfig, MinerError> {
-    // Current fast Triton path used by the upstream miner: k=2048, rank=128,
-    // rows=[0,1], cols=0..127.  Shape (m/n) is independent from this proof pattern.
-    build_mining_config_triton_norotl(2048, 128)
+    // Full CUDA C++ compatibility path: K=4096, rank=128 and the
+    // rows/columns pattern emitted by pearl_gemm's C++ search kernel.
+    build_mining_config_cpp_search(4096, 128)
 }
 
 fn parse_hex_32_be(s: &str) -> Result<[u8; 32], MinerError> {
@@ -203,7 +203,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.7 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.8 expects v3"),
             ));
         }
     }
@@ -423,24 +423,8 @@ fn hit_poller(rx: mpsc::Receiver<HitWork>, pool: Arc<SharedPool>) {
 }
 
 fn pick_config() -> MinerBufsConfig {
-    match std::env::var("PRL_SHAPE")
-        .unwrap_or_else(|_| "small".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "huge" | "huge_m" | "32768" => {
-            println!("[miner] shape huge_m: 32768x32768x2048");
-            MinerBufsConfig::shape_huge_m()
-        }
-        "big" | "big_m" | "16384" => {
-            println!("[miner] shape big_m: 16384x32768x2048");
-            MinerBufsConfig::shape_big_m()
-        }
-        _ => {
-            println!("[miner] shape small: 8192x32768x2048 (RTX 30 starting profile)");
-            MinerBufsConfig::shape_default()
-        }
-    }
+    println!("[miner] path C++ compatibility: 2048x28672x4096 r=128 (no Triton)");
+    MinerBufsConfig::production()
 }
 
 fn pick_devices() -> Result<Vec<i32>, MinerError> {
@@ -491,177 +475,16 @@ fn resolve_worker_salt() -> String {
     format!("pid{}-{now}", std::process::id())
 }
 
-unsafe fn mine_one_cpp_noising(
+unsafe fn mine_one_cpp_safe(
     bufs: &mut MinerBufs,
     iter_idx: u64,
     stream: cu::CUstream,
 ) -> Result<(), MinerError> {
     let slot = bufs.slot(iter_idx);
-
     bufs.random_fill_a(iter_idx, slot, stream)?;
-    bufs.tensor_hash.launch(
-        bufs.a_pool[slot].ptr,
-        bufs.m * bufs.k,
-        bufs.key_tensor.ptr,
-        bufs.a_tensor_hash_pool[slot].ptr,
-        stream,
-    )?;
-    bufs.commitment_hash.launch(
-        bufs.a_tensor_hash_pool[slot].ptr,
-        bufs.b_tensor_hash.ptr,
-        bufs.key_tensor.ptr,
-        bufs.commit_a_pool[slot].ptr,
-        bufs.commit_b_pool[slot].ptr,
-        stream,
-    )?;
-
-    bufs.noise_gen.launch_dense_int8(
-        bufs.m as i32,
-        bufs.commit_a_pool[slot].ptr,
-        bufs.seed_label_a.ptr,
-        bufs.eal.ptr,
-        stream,
-    )?;
-    bufs.noise_gen.launch_dense_int8(
-        bufs.n as i32,
-        bufs.commit_b_pool[slot].ptr,
-        bufs.seed_label_b.ptr,
-        bufs.ebr.ptr,
-        stream,
-    )?;
-    bufs.noise_gen.launch_dense_fp16(
-        bufs.m as i32,
-        bufs.commit_a_pool[slot].ptr,
-        bufs.seed_label_a.ptr,
-        1,
-        bufs.eal_fp16.ptr,
-        stream,
-    )?;
-    bufs.noise_gen.launch_dense_fp16(
-        bufs.n as i32,
-        bufs.commit_b_pool[slot].ptr,
-        bufs.seed_label_b.ptr,
-        1,
-        bufs.ebr_fp16.ptr,
-        stream,
-    )?;
-
-    bufs.ear_r_major.zero()?;
-    bufs.ebl_r_major.zero()?;
-    bufs.noise_gen.launch_sparse(
-        bufs.k as i32,
-        bufs.commit_a_pool[slot].ptr,
-        bufs.seed_label_a.ptr,
-        bufs.ear_r_major.ptr,
-        stream,
-    )?;
-    bufs.noise_gen.launch_sparse(
-        bufs.k as i32,
-        bufs.commit_b_pool[slot].ptr,
-        bufs.seed_label_b.ptr,
-        bufs.ebl_r_major.ptr,
-        stream,
-    )?;
-    bufs.noise_gen.launch_transpose(
-        bufs.k as i32,
-        bufs.r as i32,
-        bufs.ear_r_major.ptr,
-        bufs.ear_k_major.ptr,
-        stream,
-    )?;
-    bufs.noise_gen.launch_transpose(
-        bufs.k as i32,
-        bufs.r as i32,
-        bufs.ebl_r_major.ptr,
-        bufs.ebl_k_major.ptr,
-        stream,
-    )?;
-
-    let triton = bufs
-        .triton
-        .as_ref()
-        .ok_or_else(|| MinerError::Other("PRL0 cpp-noising mode requires Triton search".into()))?;
-
-    // Avoid Triton's PTX noising kernels on NVIDIA 580.173.02. The equivalent
-    // CUDA C++ kernel lives in pearl_gemm.fatbin and produces the same int8
-    // wrap-around result, but avoids the libcuda PTX launch path that crashes
-    // intermittently on the tested RTX 3060 Ti HiveOS host.
-    bufs.noisy_gemm.launch_add_gemm(
-        bufs.m as i32,
-        bufs.k as i32,
-        bufs.r as i32,
-        bufs.a_pool[slot].ptr,
-        bufs.eal.ptr,
-        bufs.ear_r_major.ptr,
-        bufs.ap_ea.ptr,
-        stream,
-    )?;
-    bufs.noisy_gemm.launch_add_gemm(
-        bufs.n as i32,
-        bufs.k as i32,
-        bufs.r as i32,
-        bufs.b.ptr,
-        bufs.ebr.ptr,
-        bufs.ebl_r_major.ptr,
-        bufs.bp_eb.ptr,
-        stream,
-    )?;
-
-    triton.transcripts.zero()?;
-    triton.search.launch(
-        bufs.m as i32,
-        bufs.n as i32,
-        bufs.k as i32,
-        bufs.ap_ea.ptr,
-        bufs.bp_eb.ptr,
-        triton.transcripts.ptr,
-        stream,
-    )?;
-
-    cu_check(
-        cu::cuMemsetD32Async(
-            bufs.pow_workspace_scan.ptr,
-            0xFFFFFFFFu32,
-            1,
-            stream,
-        ),
-        "cpp-noising cuMemsetD32Async(scan)",
-    )?;
-
-    let total_candidates =
-        triton.num_triton_tile_m * triton.num_triton_tile_n * 64;
-    triton.postpass.launch_blake3_compare(
-        triton.transcripts.ptr,
-        bufs.commit_a_pool[slot].ptr,
-        bufs.pow_target_tensor.ptr,
-        bufs.pow_workspace_hash.ptr,
-        bufs.pow_workspace_hit.ptr,
-        total_candidates,
-        stream,
-    )?;
-    triton.postpass.launch_scan(
-        bufs.pow_workspace_hit.ptr,
-        total_candidates,
-        bufs.pow_workspace_scan.ptr,
-        stream,
-    )?;
-    triton.postpass.launch_emit(
-        bufs.pow_workspace_scan.ptr,
-        bufs.pow_target_tensor.ptr,
-        bufs.host_signal_header_pool[slot].device_ptr,
-        triton.num_triton_tile_m,
-        triton.num_triton_tile_n,
-        64,
-        bufs.m as i32,
-        bufs.n as i32,
-        bufs.k as i32,
-        128,
-        128,
-        64,
-        stream,
-    )?;
-
-    Ok(())
+    // With MinerBufsConfig::production(), this takes the all-CUDA C++ branch:
+    // C++ noising -> C++ fused search -> scan -> emit. No Triton PTX is loaded.
+    bufs.mine_one_post_random(slot, stream)
 }
 
 struct WorkerCtx {
@@ -707,7 +530,7 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
     );
     println!(
         "{tag} execution mode: {}",
-        if use_graphs { "CUDA graphs" } else { "safe eager CUDA + C++ noising" }
+        if use_graphs { "CUDA graphs" } else { "safe eager full C++ CUDA (no Triton)" }
     );
     let mut graphs: Option<Vec<CapturedGraph>> = None;
     let mut current: Option<Arc<ReadyJob>> = None;
@@ -1060,10 +883,103 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                 stream.synchronize()?;
                 println!("{tag} diag: postpass emit OK");
             } else {
-                println!("{tag} diag: non-Triton path");
-                unsafe { bufs.mine_one_post_random(slot, stream.handle)?; }
+                println!("{tag} diag: C++ noising A");
+                unsafe {
+                    bufs.noisy_gemm.launch_add_gemm(
+                        bufs.m as i32,
+                        bufs.k as i32,
+                        bufs.r as i32,
+                        bufs.a_pool[slot].ptr,
+                        bufs.eal.ptr,
+                        bufs.ear_r_major.ptr,
+                        bufs.ap_ea.ptr,
+                        stream.handle,
+                    )?;
+                }
                 stream.synchronize()?;
-                println!("{tag} diag: non-Triton pipeline OK");
+                println!("{tag} diag: C++ noising A OK");
+
+                println!("{tag} diag: C++ noising B");
+                unsafe {
+                    bufs.noisy_gemm.launch_add_gemm(
+                        bufs.n as i32,
+                        bufs.k as i32,
+                        bufs.r as i32,
+                        bufs.b.ptr,
+                        bufs.ebr.ptr,
+                        bufs.ebl_r_major.ptr,
+                        bufs.bp_eb.ptr,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: C++ noising B OK");
+
+                bufs.pow_workspace_hit.zero()?;
+                unsafe {
+                    cu_check(
+                        cu::cuMemsetD32Async(
+                            bufs.pow_workspace_scan.ptr,
+                            0xFFFFFFFFu32,
+                            1,
+                            stream.handle,
+                        ),
+                        "diag cpp scan sentinel",
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: C++ search workspaces OK");
+
+                println!("{tag} diag: C++ search");
+                unsafe {
+                    bufs.search.launch_r128(
+                        bufs.m as i32,
+                        bufs.n as i32,
+                        bufs.k as i32,
+                        bufs.ap_ea.ptr,
+                        bufs.bp_eb.ptr,
+                        bufs.commit_a_pool[slot].ptr,
+                        bufs.pow_target_tensor.ptr,
+                        bufs.pow_workspace_hash.ptr,
+                        bufs.pow_workspace_hit.ptr,
+                        0,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: C++ search OK");
+
+                let total = (bufs.num_tiles * 256) as i32;
+                println!("{tag} diag: C++ postpass scan");
+                unsafe {
+                    bufs.pow_scan_emit.launch_scan(
+                        bufs.pow_workspace_hit.ptr,
+                        total,
+                        bufs.pow_workspace_scan.ptr,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: C++ postpass scan OK");
+
+                println!("{tag} diag: C++ postpass emit");
+                unsafe {
+                    bufs.pow_scan_emit.launch_emit(
+                        bufs.pow_workspace_scan.ptr,
+                        bufs.pow_target_tensor.ptr,
+                        bufs.host_signal_header_pool[slot].device_ptr,
+                        0,
+                        (bufs.m / 128) as i32,
+                        (bufs.n / 128) as i32,
+                        256,
+                        bufs.m as i32,
+                        bufs.n as i32,
+                        bufs.k as i32,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: C++ postpass emit OK");
             }
 
             println!("{tag} diag: first mining iteration complete");
@@ -1078,11 +994,10 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             }
             stream.synchronize()?;
         } else {
-            // Safe eager path: one iteration at a time, using CUDA C++ noising
-            // instead of the Triton noising PTX that crashes inside libcuda on
-            // the tested NVIDIA 580.173.02 driver.
+            // Safe eager path: one iteration at a time through the full CUDA C++
+            // production pipeline. This build avoids all Triton PTX kernels.
             unsafe {
-                mine_one_cpp_noising(&mut bufs, iter_idx, stream.handle)?;
+                mine_one_cpp_safe(&mut bufs, iter_idx, stream.handle)?;
             }
             stream.synchronize()?;
             iter_idx += 1;
@@ -1154,7 +1069,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.7 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.8 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
