@@ -2,7 +2,7 @@
 # HiveOS custom miner config generator for PRL0.
 
 miner_ver() {
-  echo "0.1.5"
+  echo "0.1.6"
 }
 
 miner_config_echo() {

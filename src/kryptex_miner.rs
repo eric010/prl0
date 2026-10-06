@@ -35,7 +35,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.5";
+const AGENT: &str = "prl0-kryptex/0.1.6";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -203,7 +203,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.5 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.6 expects v3"),
             ));
         }
     }
@@ -534,7 +534,7 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
     );
     println!(
         "{tag} execution mode: {}",
-        if use_graphs { "CUDA graphs" } else { "eager CUDA (graphs disabled)" }
+        if use_graphs { "CUDA graphs" } else { "safe eager CUDA (1 iter + sync)" }
     );
     let mut graphs: Option<Vec<CapturedGraph>> = None;
     let mut current: Option<Arc<ReadyJob>> = None;
@@ -612,10 +612,15 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             }
         };
         let batch_start = iter_idx;
-        // Each ring slot is used once per batch. Clear the VRAM signal headers
-        // before launching work so stale hit status cannot survive a slot reuse.
-        for signal in &signal_dev_pool {
-            signal.zero()?;
+        // In eager compatibility mode process one slot at a time. This avoids
+        // both the upstream mapped-host zero and an 8-iteration async burst,
+        // which is unstable on the tested HiveOS/NVIDIA 580 stack.
+        if use_graphs {
+            for signal in &signal_dev_pool {
+                signal.zero()?;
+            }
+        } else {
+            signal_dev_pool[bufs.slot(iter_idx)].zero()?;
         }
 
         if !use_graphs && iter_idx == 0 {
@@ -900,13 +905,16 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             }
             stream.synchronize()?;
         } else {
-            for _ in 0..bufs.ring_size as u64 {
-                unsafe {
-                    bufs.mine_one(iter_idx, stream.handle)?;
-                }
-                iter_idx += 1;
+            // Safe eager path: never call MinerBufs::mine_one(), because that
+            // touches the upstream mapped pinned host-signal buffer. Launch a
+            // single iteration, synchronize it, then read back its 1 KiB signal.
+            let slot = bufs.slot(iter_idx);
+            unsafe {
+                bufs.random_fill_a(iter_idx, slot, stream.handle)?;
+                bufs.mine_one_post_random(slot, stream.handle)?;
             }
             stream.synchronize()?;
+            iter_idx += 1;
         }
 
         let mut hits = Vec::<(Vec<u8>, Vec<u8>)>::new();
@@ -975,7 +983,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.5 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.6 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
