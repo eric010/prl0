@@ -2,7 +2,7 @@
 # HiveOS custom miner config generator for PRL0.
 
 miner_ver() {
-  echo "0.1.0"
+  echo "0.1.2"
 }
 
 miner_config_echo() {
@@ -24,6 +24,7 @@ miner_config_gen() {
   local pass="${CUSTOM_PASS:-x}"
   local shape="small"
   local devices=""
+  local graphs="0"
 
   # Hive often expands %WAL%.%WORKER_NAME% before h-config.sh is called.
   # PRL0 sends wallet and worker as separate authorize fields, so strip the
@@ -43,6 +44,7 @@ miner_config_gen() {
       case "$token" in
         shape=*) shape="${token#shape=}" ;;
         devices=*) devices="${token#devices=}" ;;
+        graphs=*) graphs="${token#graphs=}" ;;
       esac
     done
   fi
@@ -64,6 +66,7 @@ miner_config_gen() {
   printf 'PRL_SHAPE=%q\n' "$shape" >> "$cfg"
   printf 'PEARL_DEVICES=%q\n' "$devices" >> "$cfg"
   printf 'PEARL_FATBIN=%q\n' "$dir/pearl_gemm.fatbin" >> "$cfg"
+  printf 'PRL_GRAPHS=%q\n' "$graphs" >> "$cfg"
   printf 'MAX_ITERS=%q\n' "0" >> "$cfg"
 }
 
