@@ -35,7 +35,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.6";
+const AGENT: &str = "prl0-kryptex/0.1.7";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -203,7 +203,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.6 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.7 expects v3"),
             ));
         }
     }
@@ -491,6 +491,179 @@ fn resolve_worker_salt() -> String {
     format!("pid{}-{now}", std::process::id())
 }
 
+unsafe fn mine_one_cpp_noising(
+    bufs: &mut MinerBufs,
+    iter_idx: u64,
+    stream: cu::CUstream,
+) -> Result<(), MinerError> {
+    let slot = bufs.slot(iter_idx);
+
+    bufs.random_fill_a(iter_idx, slot, stream)?;
+    bufs.tensor_hash.launch(
+        bufs.a_pool[slot].ptr,
+        bufs.m * bufs.k,
+        bufs.key_tensor.ptr,
+        bufs.a_tensor_hash_pool[slot].ptr,
+        stream,
+    )?;
+    bufs.commitment_hash.launch(
+        bufs.a_tensor_hash_pool[slot].ptr,
+        bufs.b_tensor_hash.ptr,
+        bufs.key_tensor.ptr,
+        bufs.commit_a_pool[slot].ptr,
+        bufs.commit_b_pool[slot].ptr,
+        stream,
+    )?;
+
+    bufs.noise_gen.launch_dense_int8(
+        bufs.m as i32,
+        bufs.commit_a_pool[slot].ptr,
+        bufs.seed_label_a.ptr,
+        bufs.eal.ptr,
+        stream,
+    )?;
+    bufs.noise_gen.launch_dense_int8(
+        bufs.n as i32,
+        bufs.commit_b_pool[slot].ptr,
+        bufs.seed_label_b.ptr,
+        bufs.ebr.ptr,
+        stream,
+    )?;
+    bufs.noise_gen.launch_dense_fp16(
+        bufs.m as i32,
+        bufs.commit_a_pool[slot].ptr,
+        bufs.seed_label_a.ptr,
+        1,
+        bufs.eal_fp16.ptr,
+        stream,
+    )?;
+    bufs.noise_gen.launch_dense_fp16(
+        bufs.n as i32,
+        bufs.commit_b_pool[slot].ptr,
+        bufs.seed_label_b.ptr,
+        1,
+        bufs.ebr_fp16.ptr,
+        stream,
+    )?;
+
+    bufs.ear_r_major.zero()?;
+    bufs.ebl_r_major.zero()?;
+    bufs.noise_gen.launch_sparse(
+        bufs.k as i32,
+        bufs.commit_a_pool[slot].ptr,
+        bufs.seed_label_a.ptr,
+        bufs.ear_r_major.ptr,
+        stream,
+    )?;
+    bufs.noise_gen.launch_sparse(
+        bufs.k as i32,
+        bufs.commit_b_pool[slot].ptr,
+        bufs.seed_label_b.ptr,
+        bufs.ebl_r_major.ptr,
+        stream,
+    )?;
+    bufs.noise_gen.launch_transpose(
+        bufs.k as i32,
+        bufs.r as i32,
+        bufs.ear_r_major.ptr,
+        bufs.ear_k_major.ptr,
+        stream,
+    )?;
+    bufs.noise_gen.launch_transpose(
+        bufs.k as i32,
+        bufs.r as i32,
+        bufs.ebl_r_major.ptr,
+        bufs.ebl_k_major.ptr,
+        stream,
+    )?;
+
+    let triton = bufs
+        .triton
+        .as_ref()
+        .ok_or_else(|| MinerError::Other("PRL0 cpp-noising mode requires Triton search".into()))?;
+
+    // Avoid Triton's PTX noising kernels on NVIDIA 580.173.02. The equivalent
+    // CUDA C++ kernel lives in pearl_gemm.fatbin and produces the same int8
+    // wrap-around result, but avoids the libcuda PTX launch path that crashes
+    // intermittently on the tested RTX 3060 Ti HiveOS host.
+    bufs.noisy_gemm.launch_add_gemm(
+        bufs.m as i32,
+        bufs.k as i32,
+        bufs.r as i32,
+        bufs.a_pool[slot].ptr,
+        bufs.eal.ptr,
+        bufs.ear_r_major.ptr,
+        bufs.ap_ea.ptr,
+        stream,
+    )?;
+    bufs.noisy_gemm.launch_add_gemm(
+        bufs.n as i32,
+        bufs.k as i32,
+        bufs.r as i32,
+        bufs.b.ptr,
+        bufs.ebr.ptr,
+        bufs.ebl_r_major.ptr,
+        bufs.bp_eb.ptr,
+        stream,
+    )?;
+
+    triton.transcripts.zero()?;
+    triton.search.launch(
+        bufs.m as i32,
+        bufs.n as i32,
+        bufs.k as i32,
+        bufs.ap_ea.ptr,
+        bufs.bp_eb.ptr,
+        triton.transcripts.ptr,
+        stream,
+    )?;
+
+    cu_check(
+        cu::cuMemsetD32Async(
+            bufs.pow_workspace_scan.ptr,
+            0xFFFFFFFFu32,
+            1,
+            stream,
+        ),
+        "cpp-noising cuMemsetD32Async(scan)",
+    )?;
+
+    let total_candidates =
+        triton.num_triton_tile_m * triton.num_triton_tile_n * 64;
+    triton.postpass.launch_blake3_compare(
+        triton.transcripts.ptr,
+        bufs.commit_a_pool[slot].ptr,
+        bufs.pow_target_tensor.ptr,
+        bufs.pow_workspace_hash.ptr,
+        bufs.pow_workspace_hit.ptr,
+        total_candidates,
+        stream,
+    )?;
+    triton.postpass.launch_scan(
+        bufs.pow_workspace_hit.ptr,
+        total_candidates,
+        bufs.pow_workspace_scan.ptr,
+        stream,
+    )?;
+    triton.postpass.launch_emit(
+        bufs.pow_workspace_scan.ptr,
+        bufs.pow_target_tensor.ptr,
+        bufs.host_signal_header_pool[slot].device_ptr,
+        triton.num_triton_tile_m,
+        triton.num_triton_tile_n,
+        64,
+        bufs.m as i32,
+        bufs.n as i32,
+        bufs.k as i32,
+        128,
+        128,
+        64,
+        stream,
+    )?;
+
+    Ok(())
+}
+
 struct WorkerCtx {
     device_ord: i32,
     fatbin: Arc<Vec<u8>>,
@@ -534,7 +707,7 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
     );
     println!(
         "{tag} execution mode: {}",
-        if use_graphs { "CUDA graphs" } else { "safe eager CUDA (1 iter + sync)" }
+        if use_graphs { "CUDA graphs" } else { "safe eager CUDA + C++ noising" }
     );
     let mut graphs: Option<Vec<CapturedGraph>> = None;
     let mut current: Option<Arc<ReadyJob>> = None;
@@ -772,9 +945,9 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             println!("{tag} diag: transpose B OK");
 
             if let Some(triton) = bufs.triton.as_ref() {
-                println!("{tag} diag: triton noising A");
+                println!("{tag} diag: C++ noising A");
                 unsafe {
-                    triton.noising.launch(
+                    bufs.noisy_gemm.launch_add_gemm(
                         bufs.m as i32,
                         bufs.k as i32,
                         bufs.r as i32,
@@ -786,11 +959,11 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                     )?;
                 }
                 stream.synchronize()?;
-                println!("{tag} diag: triton noising A OK");
+                println!("{tag} diag: C++ noising A OK");
 
-                println!("{tag} diag: triton noising B");
+                println!("{tag} diag: C++ noising B");
                 unsafe {
-                    triton.noising.launch(
+                    bufs.noisy_gemm.launch_add_gemm(
                         bufs.n as i32,
                         bufs.k as i32,
                         bufs.r as i32,
@@ -802,7 +975,7 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                     )?;
                 }
                 stream.synchronize()?;
-                println!("{tag} diag: triton noising B OK");
+                println!("{tag} diag: C++ noising B OK");
 
                 triton.transcripts.zero()?;
                 println!("{tag} diag: transcripts zero OK");
@@ -905,13 +1078,11 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             }
             stream.synchronize()?;
         } else {
-            // Safe eager path: never call MinerBufs::mine_one(), because that
-            // touches the upstream mapped pinned host-signal buffer. Launch a
-            // single iteration, synchronize it, then read back its 1 KiB signal.
-            let slot = bufs.slot(iter_idx);
+            // Safe eager path: one iteration at a time, using CUDA C++ noising
+            // instead of the Triton noising PTX that crashes inside libcuda on
+            // the tested NVIDIA 580.173.02 driver.
             unsafe {
-                bufs.random_fill_a(iter_idx, slot, stream.handle)?;
-                bufs.mine_one_post_random(slot, stream.handle)?;
+                mine_one_cpp_noising(&mut bufs, iter_idx, stream.handle)?;
             }
             stream.synchronize()?;
             iter_idx += 1;
@@ -983,7 +1154,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.6 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.7 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
