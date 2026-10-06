@@ -33,7 +33,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.1";
+const AGENT: &str = "prl0-kryptex/0.1.2";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -201,7 +201,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.1 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.2 expects v3"),
             ));
         }
     }
@@ -509,6 +509,19 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
     println!("{tag} m={} n={} k={} r={}", bufs.m, bufs.n, bufs.k, bufs.r);
 
     let stream = Stream::new()?;
+    // CUDA graph capture segfaults on the tested HiveOS/NVIDIA 580 + RTX 3060 Ti
+    // stack. Default to the eager kernel path; graphs remain opt-in for later tests.
+    let use_graphs = matches!(
+        std::env::var("PRL_GRAPHS")
+            .unwrap_or_else(|_| "0".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    );
+    println!(
+        "{tag} execution mode: {}",
+        if use_graphs { "CUDA graphs" } else { "eager CUDA (graphs disabled)" }
+    );
     let mut graphs: Option<Vec<CapturedGraph>> = None;
     let mut current: Option<Arc<ReadyJob>> = None;
     let mut current_id = String::new();
@@ -562,7 +575,8 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                 let mut b_bytes = vec![0u8; bufs.n * bufs.k];
                 bufs.b.copy_to(&mut b_bytes)?;
                 println!("{tag} job init complete");
-                if graphs.is_none() {
+                if use_graphs && graphs.is_none() {
+                    println!("{tag} capturing CUDA graphs");
                     graphs = Some(unsafe { bufs.capture_all_slots(&stream)? });
                     println!("{tag} captured CUDA graphs");
                 }
@@ -583,13 +597,22 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                 continue;
             }
         };
-        let graphs_ref = graphs.as_mut().expect("graphs captured after job load");
         let batch_start = iter_idx;
-        for _ in 0..bufs.ring_size as u64 {
-            unsafe {
-                bufs.mine_one_with_graphs(iter_idx, graphs_ref, &stream)?;
+        if use_graphs {
+            let graphs_ref = graphs.as_mut().expect("graphs captured after job load");
+            for _ in 0..bufs.ring_size as u64 {
+                unsafe {
+                    bufs.mine_one_with_graphs(iter_idx, graphs_ref, &stream)?;
+                }
+                iter_idx += 1;
             }
-            iter_idx += 1;
+        } else {
+            for _ in 0..bufs.ring_size as u64 {
+                unsafe {
+                    bufs.mine_one(iter_idx, stream.handle)?;
+                }
+                iter_idx += 1;
+            }
         }
         stream.synchronize()?;
 
@@ -659,7 +682,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.1 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.2 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
