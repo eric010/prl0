@@ -18,7 +18,7 @@
 //! There is intentionally no developer-wallet path and no time-sliced fee.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use pearl_hashrate_miner::driver::{device_count, CapturedGraph, CudaCtx, Module, Stream};
+use pearl_hashrate_miner::driver::{device_count, CapturedGraph, CudaCtx, DevBuf, Module, Stream};
 use pearl_hashrate_miner::gateway::{build_mining_config_triton_norotl, MiningConfig};
 use pearl_hashrate_miner::miner_bufs::HOST_SIGNAL_HEADER_SIZE;
 use pearl_hashrate_miner::proof::{
@@ -33,7 +33,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.2";
+const AGENT: &str = "prl0-kryptex/0.1.3";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -201,7 +201,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.2 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.3 expects v3"),
             ));
         }
     }
@@ -508,6 +508,18 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
     let mut bufs = MinerBufs::new(&module, w.cfg)?;
     println!("{tag} m={} n={} k={} r={}", bufs.m, bufs.n, bufs.k, bufs.r);
 
+    // NVIDIA 580 on this HiveOS host crashes when a kernel writes directly to
+    // CU_MEMHOSTALLOC_DEVICEMAP pages. Keep the upstream pinned allocations
+    // alive, but redirect every signal-header device pointer to ordinary VRAM.
+    // After each batch we copy the tiny 1 KiB headers back to pageable RAM.
+    let signal_dev_pool = (0..bufs.ring_size)
+        .map(|_| DevBuf::alloc(HOST_SIGNAL_HEADER_SIZE))
+        .collect::<Result<Vec<_>, MinerError>>()?;
+    for slot in 0..bufs.ring_size {
+        bufs.host_signal_header_pool[slot].device_ptr = signal_dev_pool[slot].ptr;
+    }
+    println!("{tag} host signal: device RAM + D2H (DEVICEMAP disabled)");
+
     let stream = Stream::new()?;
     // CUDA graph capture segfaults on the tested HiveOS/NVIDIA 580 + RTX 3060 Ti
     // stack. Default to the eager kernel path; graphs remain opt-in for later tests.
@@ -598,6 +610,11 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             }
         };
         let batch_start = iter_idx;
+        // Each ring slot is used once per batch. Clear the VRAM signal headers
+        // before launching work so stale hit status cannot survive a slot reuse.
+        for signal in &signal_dev_pool {
+            signal.zero()?;
+        }
         if use_graphs {
             let graphs_ref = graphs.as_mut().expect("graphs captured after job load");
             for _ in 0..bufs.ring_size as u64 {
@@ -619,11 +636,11 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
         let mut hits = Vec::<(Vec<u8>, Vec<u8>)>::new();
         for i in batch_start..iter_idx {
             let slot = bufs.slot(i);
-            let hs = bufs.host_signal_header_pool[slot].as_slice();
-            let status = u32::from_le_bytes(hs[0..4].try_into().unwrap());
+            let mut hdr = vec![0u8; HOST_SIGNAL_HEADER_SIZE];
+            signal_dev_pool[slot].copy_to(&mut hdr)?;
+            let status = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
             if status == 1 {
                 hits_total += 1;
-                let hdr = hs[..HOST_SIGNAL_HEADER_SIZE.min(hs.len())].to_vec();
                 // Hits are rare, so use a synchronous pageable-RAM copy instead
                 // of the large DEVICEMAP pinned A snapshot.
                 let mut a_bytes = vec![0u8; bufs.m * bufs.k];
@@ -682,7 +699,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.2 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.3 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
