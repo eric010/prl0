@@ -6,7 +6,7 @@ WORK_ROOT="${1:-$KIT_DIR/.build}"
 OUT_DIR="${2:-$KIT_DIR/dist}"
 SRC_DIR="$WORK_ROOT/pearl-hashrate-miner"
 PKG_DIR="$WORK_ROOT/prl0"
-VERSION="0.1.8"
+VERSION="0.1.9"
 
 for x in git cargo nvcc; do
   command -v "$x" >/dev/null 2>&1 || { echo "Falta dependência de build: $x" >&2; exit 1; }
@@ -34,7 +34,53 @@ sed -i \
   -e 's/let b_pinned = PinnedHostBuf::alloc(n \* k)?;/let b_pinned = PinnedHostBuf::alloc(1)?;/' \
   "$SRC_DIR/src/miner_bufs.rs"
 
-if ! grep -q '^name = "prl0-kryptex"$' "$SRC_DIR/Cargo.toml"; then
+# CUDA context flag 0 uses CU_CTX_SCHED_AUTO, which can busy-spin in
+# cuStreamSynchronize when the number of CUDA contexts is close to the number
+# of logical CPUs. PRL0 synchronizes every iteration for driver stability, so
+# use CU_CTX_SCHED_BLOCKING_SYNC (0x04) to let Linux sleep the worker thread
+# while the GPU is running.
+sed -i   's/cu::cuCtxCreate_v2(&mut context, 0, device)/cu::cuCtxCreate_v2(\&mut context, 0x04, device)/'   "$SRC_DIR/src/driver.rs"
+grep -q 'cu::cuCtxCreate_v2(&mut context, 0x04, device)' "$SRC_DIR/src/driver.rs" || {
+  echo "Falhou patch CU_CTX_SCHED_BLOCKING_SYNC" >&2
+  exit 1
+}
+
+if ! grep -q '^name = "prl0-kryptex"
+  cat >> "$SRC_DIR/Cargo.toml" <<'CARGO'
+
+[[bin]]
+name = "prl0-kryptex"
+path = "src/bin/kryptex_miner.rs"
+required-features = ["cuda"]
+CARGO
+fi
+
+pushd "$SRC_DIR" >/dev/null
+./csrc/build_fatbin.sh
+cargo build --release --bin prl0-kryptex --features cuda
+popd >/dev/null
+
+FATBIN="/tmp/pearl_gemm.fatbin"
+[[ -f "$FATBIN" ]] || FATBIN="$SRC_DIR/pearl_gemm.fatbin"
+[[ -f "$FATBIN" ]] || { echo "pearl_gemm.fatbin não foi encontrado" >&2; exit 1; }
+
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR"
+cp "$SRC_DIR/target/release/prl0-kryptex" "$PKG_DIR/prl0-kryptex"
+cp "$FATBIN" "$PKG_DIR/pearl_gemm.fatbin"
+cp "$KIT_DIR/hiveos/h-manifest.conf" "$PKG_DIR/h-manifest.conf"
+cp "$KIT_DIR/hiveos/h-config.sh" "$PKG_DIR/h-config.sh"
+cp "$KIT_DIR/hiveos/h-run.sh" "$PKG_DIR/h-run.sh"
+cp "$KIT_DIR/hiveos/h-stats.sh" "$PKG_DIR/h-stats.sh"
+cp "$KIT_DIR/NOTICE.md" "$PKG_DIR/NOTICE.md"
+cp "$SRC_DIR/LICENSE-MIT" "$PKG_DIR/LICENSE-MIT"
+cp "$SRC_DIR/LICENSE-APACHE" "$PKG_DIR/LICENSE-APACHE"
+chmod +x "$PKG_DIR/prl0-kryptex" "$PKG_DIR"/*.sh
+
+tar -C "$WORK_ROOT" -czf "$OUT_DIR/prl0-$VERSION.tar.gz" prl0
+sha256sum "$OUT_DIR/prl0-$VERSION.tar.gz" > "$OUT_DIR/prl0-$VERSION.tar.gz.sha256"
+echo "Criado: $OUT_DIR/prl0-$VERSION.tar.gz"
+ "$SRC_DIR/Cargo.toml"; then
   cat >> "$SRC_DIR/Cargo.toml" <<'CARGO'
 
 [[bin]]

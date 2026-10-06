@@ -35,7 +35,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.8";
+const AGENT: &str = "prl0-kryptex/0.1.9";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -203,7 +203,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.8 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.9 expects v3"),
             ));
         }
     }
@@ -382,6 +382,24 @@ fn pool_thread(pool: Arc<SharedPool>, addr: String, wallet: String, worker: Stri
 fn hit_poller(rx: mpsc::Receiver<HitWork>, pool: Arc<SharedPool>) {
     while let Ok(work) = rx.recv() {
         let pjob = &work.job.pool_job;
+
+        // Building the Merkle proof is CPU-heavy. If the pool has already
+        // replaced this job, do not waste CPU on a proof that can only be
+        // rejected as stale.
+        let still_current = pool
+            .latest
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|j| j.job_id == pjob.job_id))
+            .unwrap_or(false);
+        if !still_current {
+            println!(
+                "[share] gpu{} drop stale hit before proof job={}",
+                work.src_gpu, pjob.job_id
+            );
+            continue;
+        }
+
         let started = Instant::now();
         let plain = match build_plain_proof(
             work.job.m,
@@ -408,6 +426,25 @@ fn hit_poller(rx: mpsc::Receiver<HitWork>, pool: Arc<SharedPool>) {
             }
         };
         let encoded = BASE64.encode(wire);
+
+        // The CPU proof build can take long enough for a fresh notify to
+        // arrive. Re-check immediately before submit to avoid error 21.
+        let still_current = pool
+            .latest
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|j| j.job_id == pjob.job_id))
+            .unwrap_or(false);
+        if !still_current {
+            println!(
+                "[share] gpu{} drop stale hit after proof job={} build={:.3}s",
+                work.src_gpu,
+                pjob.job_id,
+                started.elapsed().as_secs_f64()
+            );
+            continue;
+        }
+
         match pool.submit(&pjob.job_id, &encoded) {
             Ok(id) => println!(
                 "[share] gpu{} submit id={} job={} proof={}B build={:.3}s",
@@ -1069,7 +1106,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.8 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.9 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
