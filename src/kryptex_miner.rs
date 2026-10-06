@@ -21,6 +21,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pearl_hashrate_miner::driver::{device_count, CapturedGraph, CudaCtx, DevBuf, Module, Stream};
 use pearl_hashrate_miner::gateway::{build_mining_config_triton_norotl, MiningConfig};
 use pearl_hashrate_miner::miner_bufs::HOST_SIGNAL_HEADER_SIZE;
+use pearl_hashrate_miner::error::cu_check;
+use cudarc::driver::sys as cu;
 use pearl_hashrate_miner::proof::{
     build_plain_proof, extract_indices, signal_header::ParsedSignalHeader,
 };
@@ -33,7 +35,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.4";
+const AGENT: &str = "prl0-kryptex/0.1.5";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -201,7 +203,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.4 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.5 expects v3"),
             ));
         }
     }
@@ -617,17 +619,276 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
         }
 
         if !use_graphs && iter_idx == 0 {
-            // One instrumented iteration to pinpoint driver faults on HiveOS.
+            // Fully instrument the first iteration and synchronize after every
+            // kernel so a driver crash can be localized to one exact stage.
             let slot = bufs.slot(iter_idx);
             println!("{tag} diag: signal VRAM clear OK");
+
             println!("{tag} diag: random A launch");
             unsafe { bufs.random_fill_a(iter_idx, slot, stream.handle)?; }
             stream.synchronize()?;
             println!("{tag} diag: random A OK");
-            println!("{tag} diag: mining pipeline launch");
-            unsafe { bufs.mine_one_post_random(slot, stream.handle)?; }
+
+            println!("{tag} diag: tensor hash A");
+            unsafe {
+                bufs.tensor_hash.launch(
+                    bufs.a_pool[slot].ptr,
+                    bufs.m * bufs.k,
+                    bufs.key_tensor.ptr,
+                    bufs.a_tensor_hash_pool[slot].ptr,
+                    stream.handle,
+                )?;
+            }
             stream.synchronize()?;
-            println!("{tag} diag: mining pipeline OK");
+            println!("{tag} diag: tensor hash A OK");
+
+            println!("{tag} diag: commitment hash");
+            unsafe {
+                bufs.commitment_hash.launch(
+                    bufs.a_tensor_hash_pool[slot].ptr,
+                    bufs.b_tensor_hash.ptr,
+                    bufs.key_tensor.ptr,
+                    bufs.commit_a_pool[slot].ptr,
+                    bufs.commit_b_pool[slot].ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: commitment hash OK");
+
+            println!("{tag} diag: noise dense int8 A");
+            unsafe {
+                bufs.noise_gen.launch_dense_int8(
+                    bufs.m as i32,
+                    bufs.commit_a_pool[slot].ptr,
+                    bufs.seed_label_a.ptr,
+                    bufs.eal.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: noise dense int8 A OK");
+
+            println!("{tag} diag: noise dense int8 B");
+            unsafe {
+                bufs.noise_gen.launch_dense_int8(
+                    bufs.n as i32,
+                    bufs.commit_b_pool[slot].ptr,
+                    bufs.seed_label_b.ptr,
+                    bufs.ebr.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: noise dense int8 B OK");
+
+            println!("{tag} diag: noise dense fp16 A");
+            unsafe {
+                bufs.noise_gen.launch_dense_fp16(
+                    bufs.m as i32,
+                    bufs.commit_a_pool[slot].ptr,
+                    bufs.seed_label_a.ptr,
+                    1,
+                    bufs.eal_fp16.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: noise dense fp16 A OK");
+
+            println!("{tag} diag: noise dense fp16 B");
+            unsafe {
+                bufs.noise_gen.launch_dense_fp16(
+                    bufs.n as i32,
+                    bufs.commit_b_pool[slot].ptr,
+                    bufs.seed_label_b.ptr,
+                    1,
+                    bufs.ebr_fp16.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: noise dense fp16 B OK");
+
+            bufs.ear_r_major.zero()?;
+            bufs.ebl_r_major.zero()?;
+            println!("{tag} diag: sparse buffers zero OK");
+
+            println!("{tag} diag: noise sparse A");
+            unsafe {
+                bufs.noise_gen.launch_sparse(
+                    bufs.k as i32,
+                    bufs.commit_a_pool[slot].ptr,
+                    bufs.seed_label_a.ptr,
+                    bufs.ear_r_major.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: noise sparse A OK");
+
+            println!("{tag} diag: noise sparse B");
+            unsafe {
+                bufs.noise_gen.launch_sparse(
+                    bufs.k as i32,
+                    bufs.commit_b_pool[slot].ptr,
+                    bufs.seed_label_b.ptr,
+                    bufs.ebl_r_major.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: noise sparse B OK");
+
+            println!("{tag} diag: transpose A");
+            unsafe {
+                bufs.noise_gen.launch_transpose(
+                    bufs.k as i32,
+                    bufs.r as i32,
+                    bufs.ear_r_major.ptr,
+                    bufs.ear_k_major.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: transpose A OK");
+
+            println!("{tag} diag: transpose B");
+            unsafe {
+                bufs.noise_gen.launch_transpose(
+                    bufs.k as i32,
+                    bufs.r as i32,
+                    bufs.ebl_r_major.ptr,
+                    bufs.ebl_k_major.ptr,
+                    stream.handle,
+                )?;
+            }
+            stream.synchronize()?;
+            println!("{tag} diag: transpose B OK");
+
+            if let Some(triton) = bufs.triton.as_ref() {
+                println!("{tag} diag: triton noising A");
+                unsafe {
+                    triton.noising.launch(
+                        bufs.m as i32,
+                        bufs.k as i32,
+                        bufs.r as i32,
+                        bufs.a_pool[slot].ptr,
+                        bufs.eal.ptr,
+                        bufs.ear_r_major.ptr,
+                        bufs.ap_ea.ptr,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: triton noising A OK");
+
+                println!("{tag} diag: triton noising B");
+                unsafe {
+                    triton.noising.launch(
+                        bufs.n as i32,
+                        bufs.k as i32,
+                        bufs.r as i32,
+                        bufs.b.ptr,
+                        bufs.ebr.ptr,
+                        bufs.ebl_r_major.ptr,
+                        bufs.bp_eb.ptr,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: triton noising B OK");
+
+                triton.transcripts.zero()?;
+                println!("{tag} diag: transcripts zero OK");
+
+                println!("{tag} diag: triton search");
+                unsafe {
+                    triton.search.launch(
+                        bufs.m as i32,
+                        bufs.n as i32,
+                        bufs.k as i32,
+                        bufs.ap_ea.ptr,
+                        bufs.bp_eb.ptr,
+                        triton.transcripts.ptr,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: triton search OK");
+
+                unsafe {
+                    cu_check(
+                        cu::cuMemsetD32Async(
+                            bufs.pow_workspace_scan.ptr,
+                            0xFFFFFFFFu32,
+                            1,
+                            stream.handle,
+                        ),
+                        "diag cuMemsetD32Async(scan)",
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: scan sentinel OK");
+
+                let total_candidates =
+                    triton.num_triton_tile_m * triton.num_triton_tile_n * 64;
+
+                println!("{tag} diag: postpass blake3 compare");
+                unsafe {
+                    triton.postpass.launch_blake3_compare(
+                        triton.transcripts.ptr,
+                        bufs.commit_a_pool[slot].ptr,
+                        bufs.pow_target_tensor.ptr,
+                        bufs.pow_workspace_hash.ptr,
+                        bufs.pow_workspace_hit.ptr,
+                        total_candidates,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: postpass blake3 compare OK");
+
+                println!("{tag} diag: postpass scan");
+                unsafe {
+                    triton.postpass.launch_scan(
+                        bufs.pow_workspace_hit.ptr,
+                        total_candidates,
+                        bufs.pow_workspace_scan.ptr,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: postpass scan OK");
+
+                println!("{tag} diag: postpass emit");
+                unsafe {
+                    triton.postpass.launch_emit(
+                        bufs.pow_workspace_scan.ptr,
+                        bufs.pow_target_tensor.ptr,
+                        bufs.host_signal_header_pool[slot].device_ptr,
+                        triton.num_triton_tile_m,
+                        triton.num_triton_tile_n,
+                        64,
+                        bufs.m as i32,
+                        bufs.n as i32,
+                        bufs.k as i32,
+                        128,
+                        128,
+                        64,
+                        stream.handle,
+                    )?;
+                }
+                stream.synchronize()?;
+                println!("{tag} diag: postpass emit OK");
+            } else {
+                println!("{tag} diag: non-Triton path");
+                unsafe { bufs.mine_one_post_random(slot, stream.handle)?; }
+                stream.synchronize()?;
+                println!("{tag} diag: non-Triton pipeline OK");
+            }
+
+            println!("{tag} diag: first mining iteration complete");
             iter_idx += 1;
         } else if use_graphs {
             let graphs_ref = graphs.as_mut().expect("graphs captured after job load");
@@ -714,7 +975,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.4 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.5 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
