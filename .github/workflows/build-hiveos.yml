@@ -1,0 +1,32 @@
+name: Build PRL0 HiveOS
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'hiveos/**'
+      - 'build_from_upstream.sh'
+      - 'Dockerfile.build'
+      - '.github/workflows/build-hiveos.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CUDA/Rust HiveOS package
+        run: |
+          mkdir -p dist
+          docker build --progress=plain \
+            --output type=local,dest=./dist \
+            -f Dockerfile.build .
+      - name: Show checksums
+        run: cat dist/prl0-0.1.0.tar.gz.sha256
+      - name: Upload HiveOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: prl0-hiveos-0.1.0
+          path: |
+            dist/prl0-0.1.0.tar.gz
+            dist/prl0-0.1.0.tar.gz.sha256
