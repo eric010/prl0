@@ -6,7 +6,7 @@ WORK_ROOT="${1:-$KIT_DIR/.build}"
 OUT_DIR="${2:-$KIT_DIR/dist}"
 SRC_DIR="$WORK_ROOT/pearl-hashrate-miner"
 PKG_DIR="$WORK_ROOT/prl0"
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 for x in git cargo nvcc; do
   command -v "$x" >/dev/null 2>&1 || { echo "Falta dependência de build: $x" >&2; exit 1; }
@@ -22,7 +22,54 @@ fi
 
 cp "$KIT_DIR/src/kryptex_miner.rs" "$SRC_DIR/src/bin/kryptex_miner.rs"
 
-if ! grep -q '^name = "prl0-kryptex"$' "$SRC_DIR/Cargo.toml"; then
+# PRL0 does not use upstream's large mapped pinned-host snapshots. On the
+# tested HiveOS/NVIDIA 580 stack these DEVICEMAP allocations correlate with
+# libcuda mapping faults. Keep 1-byte placeholders so the public struct layout
+# remains unchanged while eliminating ~192 MiB of mapped pinned host memory.
+sed -i \
+  -e 's/let host_signal_header_pool = mk_host_ring(HOST_SIGNAL_HEADER_SIZE)?;/let host_signal_header_pool = mk_host_ring(1)?;/' \
+  -e 's/let a_snapshot_pool = mk_host_ring(m \* k)?;/let a_snapshot_pool = mk_host_ring(1)?;/' \
+  -e 's/let commit_a_snapshot_pool = mk_host_ring(32)?;/let commit_a_snapshot_pool = mk_host_ring(1)?;/' \
+  -e 's/let commit_b_snapshot_pool = mk_host_ring(32)?;/let commit_b_snapshot_pool = mk_host_ring(1)?;/' \
+  -e 's/let b_pinned = PinnedHostBuf::alloc(n \* k)?;/let b_pinned = PinnedHostBuf::alloc(1)?;/' \
+  "$SRC_DIR/src/miner_bufs.rs"
+
+if ! grep -q '^name = "prl0-kryptex"
+  cat >> "$SRC_DIR/Cargo.toml" <<'CARGO'
+
+[[bin]]
+name = "prl0-kryptex"
+path = "src/bin/kryptex_miner.rs"
+required-features = ["cuda"]
+CARGO
+fi
+
+pushd "$SRC_DIR" >/dev/null
+./csrc/build_fatbin.sh
+cargo build --release --bin prl0-kryptex --features cuda
+popd >/dev/null
+
+FATBIN="/tmp/pearl_gemm.fatbin"
+[[ -f "$FATBIN" ]] || FATBIN="$SRC_DIR/pearl_gemm.fatbin"
+[[ -f "$FATBIN" ]] || { echo "pearl_gemm.fatbin não foi encontrado" >&2; exit 1; }
+
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR"
+cp "$SRC_DIR/target/release/prl0-kryptex" "$PKG_DIR/prl0-kryptex"
+cp "$FATBIN" "$PKG_DIR/pearl_gemm.fatbin"
+cp "$KIT_DIR/hiveos/h-manifest.conf" "$PKG_DIR/h-manifest.conf"
+cp "$KIT_DIR/hiveos/h-config.sh" "$PKG_DIR/h-config.sh"
+cp "$KIT_DIR/hiveos/h-run.sh" "$PKG_DIR/h-run.sh"
+cp "$KIT_DIR/hiveos/h-stats.sh" "$PKG_DIR/h-stats.sh"
+cp "$KIT_DIR/NOTICE.md" "$PKG_DIR/NOTICE.md"
+cp "$SRC_DIR/LICENSE-MIT" "$PKG_DIR/LICENSE-MIT"
+cp "$SRC_DIR/LICENSE-APACHE" "$PKG_DIR/LICENSE-APACHE"
+chmod +x "$PKG_DIR/prl0-kryptex" "$PKG_DIR"/*.sh
+
+tar -C "$WORK_ROOT" -czf "$OUT_DIR/prl0-$VERSION.tar.gz" prl0
+sha256sum "$OUT_DIR/prl0-$VERSION.tar.gz" > "$OUT_DIR/prl0-$VERSION.tar.gz.sha256"
+echo "Criado: $OUT_DIR/prl0-$VERSION.tar.gz"
+ "$SRC_DIR/Cargo.toml"; then
   cat >> "$SRC_DIR/Cargo.toml" <<'CARGO'
 
 [[bin]]

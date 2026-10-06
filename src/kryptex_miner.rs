@@ -33,7 +33,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.3";
+const AGENT: &str = "prl0-kryptex/0.1.4";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -201,7 +201,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.3 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.4 expects v3"),
             ));
         }
     }
@@ -615,7 +615,21 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
         for signal in &signal_dev_pool {
             signal.zero()?;
         }
-        if use_graphs {
+
+        if !use_graphs && iter_idx == 0 {
+            // One instrumented iteration to pinpoint driver faults on HiveOS.
+            let slot = bufs.slot(iter_idx);
+            println!("{tag} diag: signal VRAM clear OK");
+            println!("{tag} diag: random A launch");
+            unsafe { bufs.random_fill_a(iter_idx, slot, stream.handle)?; }
+            stream.synchronize()?;
+            println!("{tag} diag: random A OK");
+            println!("{tag} diag: mining pipeline launch");
+            unsafe { bufs.mine_one_post_random(slot, stream.handle)?; }
+            stream.synchronize()?;
+            println!("{tag} diag: mining pipeline OK");
+            iter_idx += 1;
+        } else if use_graphs {
             let graphs_ref = graphs.as_mut().expect("graphs captured after job load");
             for _ in 0..bufs.ring_size as u64 {
                 unsafe {
@@ -623,6 +637,7 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                 }
                 iter_idx += 1;
             }
+            stream.synchronize()?;
         } else {
             for _ in 0..bufs.ring_size as u64 {
                 unsafe {
@@ -630,8 +645,8 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                 }
                 iter_idx += 1;
             }
+            stream.synchronize()?;
         }
-        stream.synchronize()?;
 
         let mut hits = Vec::<(Vec<u8>, Vec<u8>)>::new();
         for i in batch_start..iter_idx {
@@ -699,7 +714,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.3 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.4 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
