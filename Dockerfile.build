@@ -7,7 +7,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --pr
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /kit
 COPY . /kit
-RUN /kit/build_from_upstream.sh /work /out
+RUN chmod +x /kit/build_from_upstream.sh && bash /kit/build_from_upstream.sh /work /out
 
 FROM scratch
 COPY --from=build /out/ /
