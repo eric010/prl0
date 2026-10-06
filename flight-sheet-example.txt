@@ -1,0 +1,13 @@
+PRL0 HiveOS Custom Miner
+
+Pool URL:        prl-eu.kryptex.network:7048
+Wallet template: %WAL%.%WORKER_NAME%
+Password:        x
+Extra config:    shape=small
+
+Alternative shapes:
+  shape=big_m
+  shape=huge_m
+
+Optional GPU selection:
+  shape=small devices=0,1,2,3
