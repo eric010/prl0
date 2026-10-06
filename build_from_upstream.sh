@@ -34,12 +34,10 @@ sed -i \
   -e 's/let b_pinned = PinnedHostBuf::alloc(n \* k)?;/let b_pinned = PinnedHostBuf::alloc(1)?;/' \
   "$SRC_DIR/src/miner_bufs.rs"
 
-# CUDA context flag 0 uses CU_CTX_SCHED_AUTO, which can busy-spin in
-# cuStreamSynchronize when the number of CUDA contexts is close to the number
-# of logical CPUs. PRL0 synchronizes every iteration for driver stability, so
-# use CU_CTX_SCHED_BLOCKING_SYNC (0x04) to let Linux sleep the worker thread
-# while the GPU is running.
-sed -i   's/cu::cuCtxCreate_v2(&mut context, 0, device)/cu::cuCtxCreate_v2(\&mut context, 0x04, device)/'   "$SRC_DIR/src/driver.rs"
+# PRL0 synchronizes every mining iteration for driver stability. Use a
+# blocking-sync CUDA context so the worker thread sleeps instead of spinning
+# a CPU core while it waits for the GPU.
+sed -i 's/cu::cuCtxCreate_v2(&mut context, 0, device)/cu::cuCtxCreate_v2(\\&mut context, 0x04, device)/' "$SRC_DIR/src/driver.rs"
 grep -q 'cu::cuCtxCreate_v2(&mut context, 0x04, device)' "$SRC_DIR/src/driver.rs" || {
   echo "Falhou patch CU_CTX_SCHED_BLOCKING_SYNC" >&2
   exit 1
