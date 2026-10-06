@@ -33,7 +33,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AGENT: &str = "prl0-kryptex/0.1.0";
+const AGENT: &str = "prl0-kryptex/0.1.1";
 const RECONNECT_SECS: u64 = 2;
 const LOG_SECS: u64 = 5;
 const SUBMIT_ID_BASE: u64 = 1000;
@@ -201,7 +201,7 @@ fn pool_job_from_notify(params: &Value) -> Result<PoolJob, MinerError> {
         if v != 3 {
             return Err(miner_err(
                 "stratum.notify",
-                format!("unsupported cert_version={v}; PRL0 0.1.0 expects v3"),
+                format!("unsupported cert_version={v}; PRL0 0.1.1 expects v3"),
             ));
         }
     }
@@ -534,18 +534,34 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
                 ]
                 .concat();
                 let seed = *blake3::hash(&seed_material).as_bytes();
+                // Avoid the 64 MiB DEVICEMAP pinned B snapshot on HiveOS/NVIDIA 580.
+                // Prepare the same per-job CUDA state, then copy B into normal host RAM.
+                println!("{tag} job init: upload key/target/seed");
+                bufs.key_tensor.copy_from(&job.key)?;
+                bufs.pow_target_tensor.copy_from(&job.adjusted_target_le)?;
+                bufs.seed_tensor.copy_from(&seed)?;
+                println!("{tag} job init: generate B");
                 unsafe {
-                    bufs.ensure_for_job(
-                        &job.cache_tag,
-                        &job.key,
-                        &job.adjusted_target_le,
-                        &seed,
+                    bufs.random_int8.launch(
+                        (bufs.n * bufs.k) as i32,
+                        bufs.seed_tensor.ptr,
                         0,
+                        bufs.b.ptr,
+                        stream.handle,
+                    )?;
+                    bufs.tensor_hash.launch(
+                        bufs.b.ptr,
+                        bufs.n * bufs.k,
+                        bufs.key_tensor.ptr,
+                        bufs.b_tensor_hash.ptr,
                         stream.handle,
                     )?;
                 }
                 stream.synchronize()?;
-                let b_bytes = bufs.b_pinned.as_slice().to_vec();
+                println!("{tag} job init: copy B to host RAM");
+                let mut b_bytes = vec![0u8; bufs.n * bufs.k];
+                bufs.b.copy_to(&mut b_bytes)?;
+                println!("{tag} job init complete");
                 if graphs.is_none() {
                     graphs = Some(unsafe { bufs.capture_all_slots(&stream)? });
                     println!("{tag} captured CUDA graphs");
@@ -577,7 +593,7 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
         }
         stream.synchronize()?;
 
-        let mut hits = Vec::<(usize, Vec<u8>)>::new();
+        let mut hits = Vec::<(Vec<u8>, Vec<u8>)>::new();
         for i in batch_start..iter_idx {
             let slot = bufs.slot(i);
             let hs = bufs.host_signal_header_pool[slot].as_slice();
@@ -585,24 +601,23 @@ fn worker(w: WorkerCtx) -> Result<(), MinerError> {
             if status == 1 {
                 hits_total += 1;
                 let hdr = hs[..HOST_SIGNAL_HEADER_SIZE.min(hs.len())].to_vec();
-                unsafe { bufs.snapshot_a_for_hit(slot, stream.handle)? };
-                hits.push((slot, hdr));
+                // Hits are rare, so use a synchronous pageable-RAM copy instead
+                // of the large DEVICEMAP pinned A snapshot.
+                let mut a_bytes = vec![0u8; bufs.m * bufs.k];
+                bufs.a_pool[slot].copy_to(&mut a_bytes)?;
+                hits.push((hdr, a_bytes));
             }
         }
-        if !hits.is_empty() {
-            stream.synchronize()?;
-            for (slot, hdr) in hits {
-                let parsed = ParsedSignalHeader::parse(&hdr)?;
-                let (a_rows, b_cols) = extract_indices(&parsed);
-                let a_bytes = bufs.a_snapshot_pool[slot].as_slice().to_vec();
-                let _ = w.hit_tx.send(HitWork {
-                    job: Arc::clone(&ready),
-                    a_bytes,
-                    a_rows,
-                    b_cols,
-                    src_gpu: w.device_ord,
-                });
-            }
+        for (hdr, a_bytes) in hits {
+            let parsed = ParsedSignalHeader::parse(&hdr)?;
+            let (a_rows, b_cols) = extract_indices(&parsed);
+            let _ = w.hit_tx.send(HitWork {
+                job: Arc::clone(&ready),
+                a_bytes,
+                a_rows,
+                b_cols,
+                src_gpu: w.device_ord,
+            });
         }
 
         if w.max_iters > 0 && iter_idx >= w.max_iters {
@@ -644,7 +659,7 @@ fn run() -> Result<(), MinerError> {
     let devs = pick_devices()?;
     let cfg = pick_config();
     let fatbin = Arc::new(std::fs::read(&fatbin_path)?);
-    println!("PRL0 Kryptex 0.1.0 | DEV FEE: 0.00%");
+    println!("PRL0 Kryptex 0.1.1 | DEV FEE: 0.00%");
     println!("[miner] pool={pool_addr} worker={worker_name} GPUs={devs:?}");
     println!("[miner] fatbin={} ({} bytes)", fatbin_path, fatbin.len());
 
